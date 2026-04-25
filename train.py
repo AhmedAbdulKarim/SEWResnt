@@ -9,7 +9,9 @@ import math
 from torch.cuda import amp
 import smodels, utils
 from spikingjelly.clock_driven import functional
-from spikingjelly.datasets import dvs128_gesture
+
+# 1. IMPORT YOUR CUSTOM DATASET SCRIPT
+import dvsgc 
 
 _seed_ = 2020
 import random
@@ -34,12 +36,19 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
     for image, target in metric_logger.log_every(data_loader, print_freq, header):
         start_time = time.time()
         image, target = image.to(device), target.to(device)
-        image = image.float()  # [N, T, C, H, W]
+        image = image.float()  
 
+        # 2. DIMENSION TRANSPOSE: [N, T, C, H, W] -> [T, N, C, H, W]
+        # Most SpikingJelly models expect Time as the first dimension. 
+        image = image.transpose(0, 1)
+
+        # WARNING: If using T_train, it drops random frames. 
+        # For sequence chains, this might destroy gestural data. Recommended to not pass --T_train
         if T_train:
-            sec_list = np.random.choice(image.shape[1], T_train, replace=False)
+            # Note: Because we transposed above, time is now at index 0
+            sec_list = np.random.choice(image.shape[0], T_train, replace=False)
             sec_list.sort()
-            image = image[:, sec_list]
+            image = image[sec_list, :]
 
         if scaler is not None:
             with amp.autocast():
@@ -63,7 +72,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
         functional.reset_net(model)
 
         acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-        batch_size = image.shape[0]
+        batch_size = image.shape[1] # Batch size is now dimension 1 due to transpose
         loss_s = loss.item()
         if math.isnan(loss_s):
             raise ValueError('loss is Nan')
@@ -81,7 +90,6 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
     return metric_logger.loss.global_avg, metric_logger.acc1.global_avg, metric_logger.acc5.global_avg
 
 
-
 def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test:'):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -90,12 +98,16 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test
             image = image.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             image = image.float()
+            
+            # 2. DIMENSION TRANSPOSE: [N, T, C, H, W] -> [T, N, C, H, W]
+            image = image.transpose(0, 1)
+
             output = model(image)
             loss = criterion(output, target)
             functional.reset_net(model)
 
             acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
-            batch_size = image.shape[0]
+            batch_size = image.shape[1] # Batch size is now dimension 1
             metric_logger.update(loss=loss.item())
             metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
@@ -106,16 +118,34 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test
     print(f' * Acc@1 = {acc1}, Acc@5 = {acc5}, loss = {loss}')
     return loss, acc1, acc5
 
-def load_data(dataset_dir, distributed, T):
+
+# 3. UPDATE LOAD_DATA SIGNATURE
+def load_data(dataset_dir, distributed, T, seq_len, class_num):
     # Data loading code
     print("Loading data")
 
     st = time.time()
 
-    dataset_train = dvs128_gesture.DVS128Gesture(root=dataset_dir, train=True, data_type='frame', frames_number=T, split_by='number')
-    dataset_test = dvs128_gesture.DVS128Gesture(root=dataset_dir, train=False, data_type='frame', frames_number=T,
-                                                 split_by='number')
-
+    # 4. INSTANTIATE YOUR CUSTOM DATASET
+    dataset_train = dvsgc.DVSGestureChain(
+        root=dataset_dir, 
+        split='train', 
+        frames_number=T, 
+        seq_len=seq_len, 
+        class_num=class_num, 
+        alpha_min=0.5, 
+        alpha_max=0.7
+    )
+    
+    dataset_test = dvsgc.DVSGestureChain(
+        root=dataset_dir, 
+        split='test', 
+        frames_number=T, 
+        seq_len=seq_len, 
+        class_num=class_num, 
+        alpha_min=0.5, 
+        alpha_max=0.7
+    )
 
     print("Took", time.time() - st)
 
@@ -129,11 +159,10 @@ def load_data(dataset_dir, distributed, T):
 
     return dataset_train, dataset_test, train_sampler, test_sampler
 
-def main(args):
 
+def main(args):
     max_test_acc1 = 0.
     test_acc5_at_max_test_acc1 = 0.
-
 
     train_tb_writer = None
     te_tb_writer = None
@@ -166,13 +195,14 @@ def main(args):
     if not os.path.exists(output_dir):
         utils.mkdir(output_dir)
 
-
-
     device = torch.device(args.device)
 
     data_path = args.data_path
 
-    dataset_train, dataset_test, train_sampler, test_sampler = load_data(data_path, args.distributed, args.T)
+    # 5. PASS NEW ARGS TO LOAD_DATA
+    dataset_train, dataset_test, train_sampler, test_sampler = load_data(
+        data_path, args.distributed, args.T, args.seq_len, args.class_num
+    )
     print(f'dataset_train:{dataset_train.__len__()}, dataset_test:{dataset_test.__len__()}')
 
     data_loader = torch.utils.data.DataLoader(
@@ -183,8 +213,13 @@ def main(args):
         dataset_test, batch_size=args.batch_size,
         sampler=test_sampler, num_workers=args.workers, pin_memory=True)
 
-    model = smodels.__dict__[args.model](args.connect_f)
+    # 6. DYNAMIC NUMBER OF CLASSES
+    num_classes = len(dataset_train.classes)
+    print(f"Dataset generated {num_classes} unique sequence combinations.")
+    
     print("Creating model")
+    # Ensure smodels/__init__.py or the model definition accepts 'num_classes'
+    model = smodels.__dict__[args.model](args.connect_f, num_classes=num_classes)
 
     model.to(device)
     if args.distributed and args.sync_bn:
@@ -221,9 +256,7 @@ def main(args):
         test_acc5_at_max_test_acc1 = checkpoint['test_acc5_at_max_test_acc1']
 
     if args.test_only:
-
         evaluate(model, criterion, data_loader_test, device=device, header='Test:')
-
         return
 
     if args.tb and utils.is_main_process():
@@ -243,29 +276,29 @@ def main(args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         train_loss, train_acc1, train_acc5 = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args.print_freq, scaler, args.T_train)
+        
         if utils.is_main_process():
-            train_tb_writer.add_scalar('train_loss', train_loss, epoch)
-            train_tb_writer.add_scalar('train_acc1', train_acc1, epoch)
-            train_tb_writer.add_scalar('train_acc5', train_acc5, epoch)
+            if train_tb_writer is not None:
+                train_tb_writer.add_scalar('train_loss', train_loss, epoch)
+                train_tb_writer.add_scalar('train_acc1', train_acc1, epoch)
+                train_tb_writer.add_scalar('train_acc5', train_acc5, epoch)
+        
         lr_scheduler.step()
 
         test_loss, test_acc1, test_acc5 = evaluate(model, criterion, data_loader_test, device=device, header='Test:')
+        
         if te_tb_writer is not None:
             if utils.is_main_process():
-
                 te_tb_writer.add_scalar('test_loss', test_loss, epoch)
                 te_tb_writer.add_scalar('test_acc1', test_acc1, epoch)
                 te_tb_writer.add_scalar('test_acc5', test_acc5, epoch)
-
 
         if max_test_acc1 < test_acc1:
             max_test_acc1 = test_acc1
             test_acc5_at_max_test_acc1 = test_acc5
             save_max = True
 
-
         if output_dir:
-
             checkpoint = {
                 'model': model_without_ddp.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -286,13 +319,13 @@ def main(args):
 
         print('Training time {}'.format(total_time_str), 'max_test_acc1', max_test_acc1, 'test_acc5_at_max_test_acc1', test_acc5_at_max_test_acc1)
         print(output_dir)
+        
     if output_dir:
         utils.save_on_master(
             checkpoint,
             os.path.join(output_dir, f'checkpoint_{epoch}.pth'))
 
     return max_test_acc1
-
 
 
 def parse_args():
@@ -337,7 +370,6 @@ def parse_args():
     parser.add_argument('--amp', action='store_true',
                         help='Use AMP training')
 
-
     # distributed training parameters
     parser.add_argument('--world-size', default=1, type=int,
                         help='number of distributed processes')
@@ -352,20 +384,13 @@ def parse_args():
     parser.add_argument('--connect_f', type=str, help='element-wise connect function')
     parser.add_argument('--T_train', type=int)
 
+    # 7. ADD NEW SEQUENCE ARGUMENTS
+    parser.add_argument('--seq_len', default=4, type=int, help='number of gestures in the chain')
+    parser.add_argument('--class_num', default=4, type=int, help='number of base classes to use')
+
     args = parser.parse_args()
     return args
-
-
 
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-
-'''
-/raid/wfang/datasets/DVS128Gesture
-
-python train.py --tb --amp --output-dir ./logs --model PlainNet --device cuda:0 --lr-step-size 64 --epoch 192 --T_train 12 --T 16 --data-path /raid/wfang/datasets/DVS128Gesture
-
-python train.py --tb --amp --output-dir ./logs --model SEWResNet --connect_f ADD --device cuda:0 --lr-step-size 64 --epoch 192 --T_train 12 --T 16 --data-path /raid/wfang/datasets/DVS128Gesture
-
-'''
