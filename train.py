@@ -40,7 +40,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, pri
 
         # 2. DIMENSION TRANSPOSE: [N, T, C, H, W] -> [T, N, C, H, W]
         # Most SpikingJelly models expect Time as the first dimension. 
-        image = image.transpose(0, 1)
+        #image = image.transpose(0, 1)
 
         # WARNING: If using T_train, it drops random frames. 
         # For sequence chains, this might destroy gestural data. Recommended to not pass --T_train
@@ -100,7 +100,7 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, header='Test
             image = image.float()
             
             # 2. DIMENSION TRANSPOSE: [N, T, C, H, W] -> [T, N, C, H, W]
-            image = image.transpose(0, 1)
+            #image = image.transpose(0, 1)
 
             output = model(image)
             loss = criterion(output, target)
@@ -219,8 +219,19 @@ def main(args):
     
     print("Creating model")
     # Ensure smodels/__init__.py or the model definition accepts 'num_classes'
-    model = smodels.__dict__[args.model](args.connect_f, num_classes=num_classes)
+    # model = smodels.__dict__[args.model](args.connect_f, num_classes=num_classes)
 
+    print("Creating model")
+    model = smodels.__dict__[args.model](args.connect_f)
+
+    # Dynamically replace the final classification head
+    if hasattr(model, 'out'):
+        in_features = model.out.in_features
+        model.out = nn.Linear(in_features, num_classes)
+        print(f"Successfully replaced final layer: {in_features} IN -> {num_classes} OUT")
+    else:
+        raise NotImplementedError("Could not find the 'out' layer to replace.")
+    
     model.to(device)
     if args.distributed and args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
